@@ -11,9 +11,12 @@ pub struct Process {
     pub cwd: Option<PathBuf>,
     pub cgroup: Option<String>,
     pub netns: Option<String>,
-    /// Mount namespace: a different one means a different filesystem view
-    /// (container, Flatpak, Snap…), whose files are not the host's.
-    pub mntns: Option<String>,
+    /// Identity of the process's root directory. A different root means a
+    /// different filesystem (container, Flatpak, Snap…), whose files are not
+    /// the host's. A mount namespace alone is not enough: hardened systemd
+    /// services (`ProtectSystem=`, `PrivateTmp=`) have their own namespace but
+    /// still run the host's files.
+    pub root: Option<RootId>,
     pub mapped: Vec<MappedFile>,
     pub socket_inodes: Vec<u64>,
     /// False when permissions prevented reading its executable, memory map or sockets.
@@ -95,6 +98,16 @@ pub fn namespace(process_dir: &Path, kind: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Device and inode of a filesystem root.
+pub type RootId = (u64, u64);
+
+/// Identity of the root directory seen by a process (`/proc/<pid>/root`).
+pub fn root_id(process_dir: &Path) -> Option<RootId> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(process_dir.join("root")).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
 fn denied<T>(result: &std::io::Result<T>) -> bool {
     matches!(result, Err(e) if e.kind() == ErrorKind::PermissionDenied)
 }
@@ -135,7 +148,7 @@ pub fn read_process(proc_root: &Path, pid: u32) -> Option<Process> {
             .as_deref()
             .and_then(parse_cgroup),
         netns: namespace(&dir, "net"),
-        mntns: namespace(&dir, "mnt"),
+        root: root_id(&dir),
         mapped: maps.map(|text| parse_maps(&text)).unwrap_or_default(),
         socket_inodes,
         inspected,
@@ -168,6 +181,8 @@ pub fn scan(proc_root: &Path) -> std::io::Result<Scan> {
 pub enum Owner {
     Unit(String),
     Container(String),
+    /// systemd itself (PID 1), which holds the sockets of socket-activated units.
+    Init,
     Process,
 }
 
@@ -187,6 +202,9 @@ pub fn owner(cgroup: Option<&str>) -> Owner {
         return Owner::Process;
     };
     let segments: Vec<&str> = cgroup.split('/').filter(|s| !s.is_empty()).collect();
+    if segments == ["init.scope"] {
+        return Owner::Init;
+    }
     if let Some(id) = segments.iter().rev().find_map(|s| container_id(s)) {
         return Owner::Container(id);
     }
@@ -262,6 +280,7 @@ mod tests {
             Owner::Process
         );
         assert_eq!(owner(None), Owner::Process);
+        assert_eq!(owner(Some("/init.scope")), Owner::Init);
     }
 
     #[test]

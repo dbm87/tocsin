@@ -150,15 +150,9 @@ pub fn collect(options: &Options) -> Inventory {
                 ));
             }
             let sockets = net::listening_sockets(&options.proc_root, &scan.processes);
-            let host_mntns = procfs::namespace(&options.proc_root.join("1"), "mnt")
-                .or_else(|| procfs::namespace(&options.proc_root.join("self"), "mnt"));
-            build_services(
-                &scan.processes,
-                &sockets,
-                &files,
-                &projects,
-                host_mntns.as_deref(),
-            )
+            let host_root = procfs::root_id(&options.proc_root.join("1"))
+                .or_else(|| procfs::root_id(&options.proc_root.join("self")));
+            build_services(&scan.processes, &sockets, &files, &projects, host_root)
         }
         Err(e) => {
             warnings.push(format!("cannot read {}: {e}", options.proc_root.display()));
@@ -256,27 +250,42 @@ impl ServiceBuilder {
 /// Processes outside any systemd unit or container are kept only when they
 /// listen on a port or run from a designated project, to avoid listing shells.
 ///
-/// Files are attributed to host packages only for processes that share the
-/// host's mount namespace (`host_mntns`): a container maps files of its own
+/// Files are attributed to host packages only for processes that see the
+/// host's root directory (`host_root`): a container maps files of its own
 /// image, and attributing them to host packages would be wrong.
+///
+/// systemd (PID 1) holds the sockets of socket-activated units: such a socket
+/// is reported under the unit using it, or under "systemd (socket activation)"
+/// while no unit has started yet.
 pub fn build_services(
     processes: &[Process],
     sockets: &HashMap<u64, Socket>,
     files: &HashMap<String, String>,
     projects: &[Project],
-    host_mntns: Option<&str>,
+    host_root: Option<procfs::RootId>,
 ) -> Vec<Service> {
+    let owners: Vec<Owner> = processes
+        .iter()
+        .map(|p| procfs::owner(p.cgroup.as_deref()))
+        .collect();
+    let held_by_services: HashSet<u64> = processes
+        .iter()
+        .zip(&owners)
+        .filter(|(_, owner)| **owner != Owner::Init)
+        .flat_map(|(p, _)| p.socket_inodes.iter().copied())
+        .collect();
+
     let mut builders: BTreeMap<String, ServiceBuilder> = BTreeMap::new();
-    for process in processes {
-        let owner = procfs::owner(process.cgroup.as_deref());
+    for (process, owner) in processes.iter().zip(owners) {
         let host_filesystem = !matches!(owner, Owner::Container(_))
-            && match (host_mntns, process.mntns.as_deref()) {
+            && match (host_root, process.root) {
                 (Some(host), Some(own)) => host == own,
                 _ => true,
             };
         let listeners: Vec<Listener> = process
             .socket_inodes
             .iter()
+            .filter(|inode| owner != Owner::Init || !held_by_services.contains(inode))
             .filter_map(|inode| sockets.get(inode))
             .map(Listener::from)
             .collect();
@@ -293,6 +302,12 @@ pub fn build_services(
         let (id, kind, name) = match owner {
             Owner::Unit(unit) => (format!("systemd:{unit}"), ServiceKind::SystemdUnit, unit),
             Owner::Container(id) => (format!("container:{id}"), ServiceKind::Container, id),
+            Owner::Init if listeners.is_empty() => continue,
+            Owner::Init => (
+                "systemd:init.scope".to_owned(),
+                ServiceKind::SystemdUnit,
+                "systemd (socket activation)".to_owned(),
+            ),
             Owner::Process if listeners.is_empty() && in_projects.is_empty() => continue,
             Owner::Process => (
                 format!("process:{}", process.pid),
@@ -398,7 +413,7 @@ mod tests {
             cwd: Some("/".into()),
             cgroup: Some(cgroup.into()),
             netns: Some("net:[1]".into()),
-            mntns: Some(HOST_MNT.into()),
+            root: Some(HOST_ROOT),
             mapped: mapped
                 .iter()
                 .map(|(p, d)| MappedFile {
@@ -459,7 +474,7 @@ mod tests {
                 &[],
             ),
         ];
-        let services = build_services(&processes, &sockets, &files, &[], Some(HOST_MNT));
+        let services = build_services(&processes, &sockets, &files, &[], Some(HOST_ROOT));
         assert_eq!(services.len(), 1);
         let nginx = &services[0];
         assert_eq!(nginx.id, "systemd:nginx.service");
@@ -511,7 +526,7 @@ mod tests {
             &sockets,
             &HashMap::new(),
             &[project],
-            Some(HOST_MNT),
+            Some(HOST_ROOT),
         );
         assert_eq!(services[0].id, "process:30");
         assert_eq!(services[0].exposure(), Some(Exposure::Loopback));
@@ -548,13 +563,13 @@ mod tests {
             &libssl,
             &[],
         );
-        flatpak.mntns = Some("mnt:[999]".into());
+        flatpak.root = Some((99, 2));
         let services = build_services(
             &[container, flatpak],
             &HashMap::new(),
             &files,
             &[],
-            Some(HOST_MNT),
+            Some(HOST_ROOT),
         );
         assert_eq!(services.len(), 2);
         for service in &services {
@@ -567,7 +582,65 @@ mod tests {
         }
     }
 
-    const HOST_MNT: &str = "mnt:[4026531841]";
+    #[test]
+    fn hardened_service_in_own_namespace_keeps_host_packages() {
+        // ProtectSystem=strict gives the service its own mount namespace, but
+        // its root directory is still the host's: its files are host files.
+        let files: HashMap<String, String> = [(
+            "/usr/sbin/chronyd".to_owned(),
+            "pkg:deb/ubuntu/chrony@4.5".to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        let chrony = process(
+            50,
+            "/system.slice/chrony.service",
+            "/usr/sbin/chronyd",
+            &[],
+            &[],
+        );
+        let services = build_services(&[chrony], &HashMap::new(), &files, &[], Some(HOST_ROOT));
+        assert_eq!(services[0].uses.len(), 1);
+        assert!(!services[0].separate_filesystem);
+    }
+
+    #[test]
+    fn socket_activation_is_reported_under_the_unit() {
+        let sockets: HashMap<u64, Socket> = [3, 4]
+            .into_iter()
+            .map(|inode| {
+                let socket = Socket {
+                    protocol: "tcp",
+                    address: "0.0.0.0".parse().unwrap(),
+                    port: if inode == 3 { 22 } else { 9090 },
+                    inode,
+                };
+                (inode, socket)
+            })
+            .collect();
+        // PID 1 holds both sockets; sshd has been started and shares the first.
+        let init = process(1, "/init.scope", "/usr/lib/systemd/systemd", &[], &[3, 4]);
+        let sshd = process(60, "/system.slice/ssh.service", "/usr/sbin/sshd", &[], &[3]);
+        let services = build_services(
+            &[init, sshd],
+            &sockets,
+            &HashMap::new(),
+            &[],
+            Some(HOST_ROOT),
+        );
+        let ports = |id: &str| -> Vec<u16> {
+            let service = services.iter().find(|s| s.id == id).unwrap();
+            service.listening.iter().map(|l| l.port).collect()
+        };
+        assert_eq!(ports("systemd:ssh.service"), [22]);
+        assert_eq!(
+            ports("systemd:init.scope"),
+            [9090],
+            "only the socket no unit has taken yet"
+        );
+    }
+
+    const HOST_ROOT: procfs::RootId = (2049, 2);
 
     #[test]
     fn usr_merge_lookup_both_ways() {
