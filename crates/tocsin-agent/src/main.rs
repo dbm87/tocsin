@@ -19,7 +19,7 @@ use tocsin_core::{
     Action, Advisory, Declaration, Exposure, Mitigation, Policy, Purl, Signals, effective_priority,
 };
 use tocsin_sources::cache::Cache;
-use tocsin_sources::{kev, osv};
+use tocsin_sources::{kev, offline, osv};
 
 #[derive(Parser)]
 #[command(name = "tocsin", version, about = "Tocsin reference agent (prototype)")]
@@ -40,7 +40,8 @@ enum Command {
     /// Inventory this Linux machine: components, services, listening ports.
     Inventory(InventoryArgs),
     /// Inventory this machine, then look its components up in OSV.dev and the
-    /// CISA KEV catalog. Package names and versions are sent to OSV.dev.
+    /// CISA KEV catalog. Package names and versions are sent to OSV.dev,
+    /// unless --offline is given.
     Scan(ScanArgs),
 }
 
@@ -67,6 +68,19 @@ struct ScanArgs {
     /// Parallel downloads of advisories.
     #[arg(long, default_value_t = 16)]
     workers: usize,
+    /// Match locally against the public OSV exports instead of querying
+    /// OSV.dev: no package name or version leaves the machine. The first run
+    /// downloads the export of each ecosystem (several hundred MB for a
+    /// distribution), later runs fetch only the records modified since.
+    #[arg(long)]
+    offline: bool,
+    /// Offline mode without any download: use the local OSV databases and the
+    /// cached KEV catalog as they are (machines without network access).
+    #[arg(long)]
+    no_update: bool,
+    /// Offline mode: minutes between update checks of the local OSV databases.
+    #[arg(long, default_value_t = 60, value_name = "MINUTES")]
+    update_after: u64,
     #[arg(long, default_value = "/", hide = true)]
     fs_root: PathBuf,
     #[arg(long, default_value = "/proc", hide = true)]
@@ -323,52 +337,96 @@ fn scan_command(args: ScanArgs) -> Result<()> {
         args.cache_dir.or_else(Cache::default_dir).map(Cache::new)
     };
     let agent = tocsin_sources::http_agent();
-    let client = osv::Client::new(agent.clone(), cache.clone());
+    let offline = args.offline || args.no_update;
+    let mut warnings = inventory.warnings.clone();
 
-    eprintln!(
-        "querying OSV.dev for {} package(s): their names and versions are sent to api.osv.dev",
-        plan.queries.len()
-    );
-    let matches = client.query_batch(&plan.queries)?;
-    let mut unique: Vec<osv::VulnRef> = matches.iter().flatten().cloned().collect();
-    unique.sort_by(|a, b| a.id.cmp(&b.id));
-    unique.dedup_by(|a, b| a.id == b.id);
-
-    eprintln!("fetching {} advisorie(s)", unique.len());
-    let reported = AtomicUsize::new(0);
-    let progress = |done: usize, total: usize| {
-        let tenth = done * 10 / total.max(1);
-        if tenth > reported.fetch_max(tenth, Ordering::Relaxed) {
-            eprintln!("  {}%", tenth * 10);
+    let (matches, advisories, databases) = if offline {
+        let Some(cache) = &cache else {
+            bail!(
+                "the offline mode keeps its OSV databases in the cache directory: drop --no-cache"
+            );
+        };
+        let store = offline::Store::new(cache.dir().join("osv-offline"), agent.clone())
+            .with_workers(args.workers)
+            .with_log(|message| eprintln!("{message}"));
+        let refresh = if args.no_update {
+            offline::Refresh::Never
+        } else {
+            offline::Refresh::After(Duration::from_secs(args.update_after * 60))
+        };
+        eprintln!(
+            "matching {} package(s) locally against the OSV exports: nothing about them is sent",
+            plan.queries.len()
+        );
+        let lookup = scan::lookup_offline(&plan, &store, refresh);
+        warnings.extend(lookup.warnings);
+        if let Some(first) = lookup.undetermined.first() {
+            warnings.push(format!(
+                "{} advisory match(es) left out: versions not comparable, first: {first}",
+                lookup.undetermined.len()
+            ));
         }
-    };
-    let (fetched, errors) = client.fetch_all(&unique, args.workers, &progress);
-    let advisories: HashMap<String, Advisory> =
-        fetched.into_iter().map(|a| (a.id.clone(), a)).collect();
+        (lookup.matches, lookup.advisories, Some(lookup.databases))
+    } else {
+        let client = osv::Client::new(agent.clone(), cache.clone());
+        eprintln!(
+            "querying OSV.dev for {} package(s): their names and versions are sent to api.osv.dev",
+            plan.queries.len()
+        );
+        let matches = client.query_batch(&plan.queries)?;
+        let mut unique: Vec<osv::VulnRef> = matches.iter().flatten().cloned().collect();
+        unique.sort_by(|a, b| a.id.cmp(&b.id));
+        unique.dedup_by(|a, b| a.id == b.id);
 
-    let kev = kev::Catalog::load(&agent, cache.as_ref(), Duration::from_secs(24 * 3600))
-        .unwrap_or_else(|error| {
+        eprintln!("fetching {} advisorie(s)", unique.len());
+        let reported = AtomicUsize::new(0);
+        let progress = |done: usize, total: usize| {
+            let tenth = done * 10 / total.max(1);
+            if tenth > reported.fetch_max(tenth, Ordering::Relaxed) {
+                eprintln!("  {}%", tenth * 10);
+            }
+        };
+        let (fetched, errors) = client.fetch_all(&unique, args.workers, &progress);
+        if !errors.is_empty() {
+            warnings.push(format!(
+                "{} advisorie(s) could not be fetched, first: {}",
+                errors.len(),
+                errors[0]
+            ));
+        }
+        let advisories: HashMap<String, Advisory> =
+            fetched.into_iter().map(|a| (a.id.clone(), a)).collect();
+        (matches, advisories, None)
+    };
+
+    let kev_max_age = Duration::from_secs(24 * 3600);
+    let kev = if args.no_update {
+        cache
+            .as_ref()
+            .and_then(|c| kev::Catalog::from_cache(c, kev_max_age))
+            .unwrap_or_else(|| {
+                eprintln!("warning: no cached KEV catalog; continuing without it");
+                kev::Catalog::default()
+            })
+    } else {
+        kev::Catalog::load(&agent, cache.as_ref(), kev_max_age).unwrap_or_else(|error| {
             eprintln!("warning: {error:#}; continuing without the KEV catalog");
             kev::Catalog::default()
-        });
+        })
+    };
     if kev.stale {
-        eprintln!("warning: KEV catalog download failed, using an older cached copy");
+        warnings.push(format!(
+            "KEV catalog not refreshed: using the cached version {}",
+            kev.version.as_deref().unwrap_or("?")
+        ));
     }
 
     let findings = scan::correlate(&inventory, &plan, &matches, &advisories, &kev, &policy);
-    let mut warnings = inventory.warnings.clone();
     if plan.unsupported > 0 {
         warnings.push(format!(
             "{} system package(s) not looked up: OSV.dev has no data for this distribution ({})",
             plan.unsupported,
             inventory.host.os_id.as_deref().unwrap_or("unknown")
-        ));
-    }
-    if !errors.is_empty() {
-        warnings.push(format!(
-            "{} advisorie(s) could not be fetched, first: {}",
-            errors.len(),
-            errors[0]
         ));
     }
 
@@ -378,6 +436,8 @@ fn scan_command(args: ScanArgs) -> Result<()> {
                 "host": inventory.host,
                 "components": inventory.components.len(),
                 "queries": plan.queries.len(),
+                "osv_source": if offline { "exports" } else { "api" },
+                "osv_databases": databases,
                 "advisories": advisories.len(),
                 "kev_catalog": kev.version,
                 "findings": findings,
@@ -388,6 +448,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
         ScanFormat::Summary => print_scan_summary(
             &inventory,
             &plan,
+            databases.as_deref(),
             &findings,
             &kev,
             &warnings,
@@ -400,6 +461,7 @@ fn scan_command(args: ScanArgs) -> Result<()> {
 fn print_scan_summary(
     inventory: &tocsin_inventory::model::Inventory,
     plan: &scan::Plan,
+    databases: Option<&[scan::DatabaseInfo]>,
     findings: &[scan::Finding],
     kev: &kev::Catalog,
     warnings: &[String],
@@ -416,10 +478,35 @@ fn print_scan_summary(
             .as_deref()
             .unwrap_or("no OSV ecosystem")
     );
+    let source = match databases {
+        None => format!("{} OSV.dev quer(ies)", plan.queries.len()),
+        Some(databases) => {
+            let list = databases
+                .iter()
+                .map(|db| {
+                    format!(
+                        "{} up to {}{}",
+                        db.ecosystem,
+                        db.synced,
+                        if db.stale { ", outdated" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "{} package(s) matched offline against OSV exports ({})",
+                plan.queries.len(),
+                if list.is_empty() {
+                    "none available"
+                } else {
+                    &list
+                }
+            )
+        }
+    };
     println!(
-        "scanned {} component(s) in {} OSV quer(ies); KEV catalog {} ({} entries)",
+        "scanned {} component(s): {source}; KEV catalog {} ({} entries)",
         inventory.components.len(),
-        plan.queries.len(),
         kev.version.as_deref().unwrap_or("unavailable"),
         kev.len()
     );

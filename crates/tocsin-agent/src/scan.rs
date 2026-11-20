@@ -4,12 +4,13 @@
 
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use tocsin_core::advisory::Match;
 use tocsin_core::policy::Context;
 use tocsin_core::{Action, Advisory, Policy, Signals, Urgency, effective_priority};
 use tocsin_inventory::Exposure;
 use tocsin_inventory::model::{Inventory, Origin};
-use tocsin_sources::kev;
 use tocsin_sources::osv::{Query, VulnRef};
+use tocsin_sources::{kev, offline};
 
 /// The OSV.dev queries for an inventory, deduplicated: binary packages built
 /// from the same source package share one query.
@@ -67,6 +68,104 @@ pub fn plan(inventory: &Inventory) -> Plan {
         plan.packages.push((name, version));
     }
     plan
+}
+
+/// State of a local OSV database used by an offline scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct DatabaseInfo {
+    pub ecosystem: String,
+    /// Newest record modification date taken into account.
+    pub synced: String,
+    pub advisories: usize,
+    /// The update failed or was skipped while due: the data may be outdated.
+    pub stale: bool,
+}
+
+/// What an offline lookup found, in the shape of the online one.
+#[derive(Debug, Default)]
+pub struct OfflineLookup {
+    pub matches: Vec<Vec<VulnRef>>,
+    pub advisories: HashMap<String, Advisory>,
+    pub databases: Vec<DatabaseInfo>,
+    /// `package version: advisory` pairs whose versions could not be compared.
+    pub undetermined: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Matches the plan against the local OSV databases, one per ecosystem,
+/// updating them first according to `refresh`. Nothing about the inventory
+/// is sent anywhere.
+pub fn lookup_offline(
+    plan: &Plan,
+    store: &offline::Store,
+    refresh: offline::Refresh,
+) -> OfflineLookup {
+    let mut lookup = OfflineLookup {
+        matches: vec![Vec::new(); plan.queries.len()],
+        ..OfflineLookup::default()
+    };
+    let targets: Vec<Option<(String, String, String)>> =
+        plan.queries.iter().map(offline::query_target).collect();
+    let mut ecosystems: Vec<&str> = targets.iter().flatten().map(|t| t.0.as_str()).collect();
+    ecosystems.sort_unstable();
+    ecosystems.dedup();
+
+    let mut databases = HashMap::new();
+    for ecosystem in ecosystems {
+        match store.open(ecosystem, refresh) {
+            Ok((db, update)) => {
+                if let offline::Update::Failed(error) = update {
+                    lookup.warnings.push(format!(
+                        "OSV database for {ecosystem} not updated ({error}); using data up to {}",
+                        db.synced
+                    ));
+                }
+                lookup.databases.push(DatabaseInfo {
+                    ecosystem: ecosystem.to_owned(),
+                    synced: db.synced.clone(),
+                    advisories: db.len(),
+                    stale: db.stale,
+                });
+                databases.insert(ecosystem.to_owned(), db);
+            }
+            Err(error) => lookup
+                .warnings
+                .push(format!("{ecosystem} packages not looked up: {error:#}")),
+        }
+    }
+
+    let unsupported = targets.iter().filter(|t| t.is_none()).count();
+    if unsupported > 0 {
+        lookup.warnings.push(format!(
+            "{unsupported} package(s) of an ecosystem the offline mode does not handle"
+        ));
+    }
+    for (index, target) in targets.iter().enumerate() {
+        let Some((ecosystem, name, version)) = target else {
+            continue;
+        };
+        let Some(db) = databases.get(ecosystem) else {
+            continue;
+        };
+        for (advisory, matched) in db.query(name, version) {
+            match matched {
+                Match::Affected => {
+                    lookup.matches[index].push(VulnRef {
+                        id: advisory.id.clone(),
+                        modified: advisory.modified.clone(),
+                    });
+                    lookup
+                        .advisories
+                        .entry(advisory.id.clone())
+                        .or_insert_with(|| advisory.clone());
+                }
+                _ => lookup
+                    .undetermined
+                    .push(format!("{name} {version}: {}", advisory.id)),
+            }
+        }
+    }
+    lookup
 }
 
 #[derive(Debug, Clone, Serialize)]

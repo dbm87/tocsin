@@ -5,7 +5,9 @@
 
 use crate::priority::Urgency;
 use crate::purl::Purl;
+use crate::version::Scheme;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Advisory {
@@ -17,6 +19,9 @@ pub struct Advisory {
     pub modified: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published: Option<String>,
+    /// Set when the advisory was retracted: it must then be ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// Upstream identifiers the advisory derives from (e.g. the CVE behind a
@@ -294,53 +299,129 @@ impl Advisory {
                 result = Match::Undetermined;
                 continue;
             };
-            if affected.versions.iter().any(|v| v == version) {
-                return Match::Affected;
+            match affected.evaluate(version, Some(Scheme::Semver)) {
+                Match::Affected => return Match::Affected,
+                Match::Undetermined => result = Match::Undetermined,
+                Match::NotAffected => {}
             }
-            for range in &affected.ranges {
-                match range_affects(range, version) {
-                    Some(true) => return Match::Affected,
-                    Some(false) => {}
-                    None => result = Match::Undetermined,
-                }
+        }
+        result
+    }
+
+    /// Does this advisory affect `version` of the package `name` in the OSV
+    /// `ecosystem` (e.g. `Ubuntu:24.04:LTS`, `npm`)? Versions are ordered
+    /// with the ecosystem's scheme: this is how OSV.dev answers a query, done
+    /// locally.
+    pub fn affects(&self, ecosystem: &str, name: &str, version: &str) -> Match {
+        let scheme = Scheme::for_ecosystem(ecosystem);
+        let mut result = Match::NotAffected;
+        for affected in &self.affected {
+            let Some(package) = &affected.package else {
+                continue;
+            };
+            if package.ecosystem.as_deref() != Some(ecosystem)
+                || !package
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| same_name(ecosystem, n, name))
+            {
+                continue;
+            }
+            match affected.evaluate(version, scheme) {
+                Match::Affected => return Match::Affected,
+                Match::Undetermined => result = Match::Undetermined,
+                Match::NotAffected => {}
             }
         }
         result
     }
 }
 
-fn parse_version(raw: &str) -> Option<semver::Version> {
-    let raw = raw.trim().trim_start_matches('v');
-    if raw == "0" {
-        return Some(semver::Version::new(0, 0, 0));
+/// Package names are compared as the ecosystem does: PyPI normalises them
+/// (PEP 503), others compare them exactly.
+pub fn same_name(ecosystem: &str, a: &str, b: &str) -> bool {
+    if ecosystem == "PyPI" {
+        normalize_pypi(a) == normalize_pypi(b)
+    } else {
+        a == b
     }
-    semver::Version::parse(raw).ok()
 }
 
-/// Evaluates an OSV range for a version. `None` when it cannot be evaluated.
-///
-/// SEMVER ranges are evaluated; ECOSYSTEM ranges are evaluated only when all
-/// their versions happen to be valid semver (common for npm and crates.io).
-fn range_affects(range: &Range, version: &str) -> Option<bool> {
-    if !matches!(range.kind, RangeKind::Semver | RangeKind::Ecosystem) {
-        return None;
+/// PEP 503 name normalisation.
+pub fn normalize_pypi(name: &str) -> String {
+    name.to_ascii_lowercase().replace(['_', '.'], "-")
+}
+
+impl Affected {
+    /// Evaluates the listed versions and ranges for `version`, ordering
+    /// `ECOSYSTEM` ranges with `scheme`. `GIT` ranges are ignored, as OSV.dev
+    /// does for version queries. When a range cannot be evaluated but the
+    /// entry enumerates affected versions, the enumeration is trusted.
+    fn evaluate(&self, version: &str, scheme: Option<Scheme>) -> Match {
+        if self.versions.iter().any(|v| v == version) {
+            return Match::Affected;
+        }
+        let mut result = Match::NotAffected;
+        let mut evaluable = 0;
+        for range in &self.ranges {
+            let scheme = match range.kind {
+                RangeKind::Semver => Some(Scheme::Semver),
+                RangeKind::Ecosystem => scheme,
+                RangeKind::Git => continue,
+                RangeKind::Other => None,
+            };
+            evaluable += 1;
+            match scheme.and_then(|s| range_affects(range, version, s)) {
+                Some(true) => return Match::Affected,
+                Some(false) => {}
+                None if self.versions.is_empty() => result = Match::Undetermined,
+                None => {}
+            }
+        }
+        if evaluable == 0 && self.versions.is_empty() {
+            // No version data this agent can use (none at all, or only GIT ranges).
+            return Match::Undetermined;
+        }
+        result
     }
-    let target = parse_version(version)?;
+}
+
+/// `introduced: "0"` means "from the very first version" in every ecosystem.
+fn compare_event(scheme: Scheme, event: &str, version: &str) -> Option<Ordering> {
+    if event == "0" {
+        return Some(if version == "0" {
+            Ordering::Equal
+        } else {
+            Ordering::Less
+        });
+    }
+    scheme.compare(event, version)
+}
+
+/// Evaluates an OSV range for a version. `None` when a version of the range
+/// cannot be ordered with `scheme`.
+fn range_affects(range: &Range, version: &str, scheme: Scheme) -> Option<bool> {
     let mut events = Vec::with_capacity(range.events.len());
     for event in &range.events {
         let raw = match event {
             Event::Introduced(v) | Event::Fixed(v) | Event::LastAffected(v) | Event::Limit(v) => v,
         };
-        events.push((parse_version(raw)?, event));
+        // Position of the event relative to the version being evaluated.
+        events.push((raw.as_str(), compare_event(scheme, raw, version)?, event));
     }
-    events.sort_by(|a, b| a.0.cmp(&b.0));
+    events.sort_by(|a, b| match (a.0 == "0", b.0 == "0") {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => scheme.compare(a.0, b.0).unwrap_or(Ordering::Equal),
+    });
 
     let mut affected = false;
-    for (at, event) in events {
+    for (_, position, event) in events {
         match event {
-            Event::Introduced(_) if at <= target => affected = true,
-            Event::Fixed(_) if at <= target => affected = false,
-            Event::LastAffected(_) if at < target => affected = false,
+            Event::Introduced(_) if position != Ordering::Greater => affected = true,
+            Event::Fixed(_) if position != Ordering::Greater => affected = false,
+            Event::LastAffected(_) if position == Ordering::Less => affected = false,
             _ => {}
         }
     }
@@ -481,5 +562,95 @@ mod tests {
         );
         let none = r#"{"id":"X-1","modified":"x"}"#;
         assert_eq!(Advisory::from_json(none).unwrap().stated_urgency(), None);
+    }
+
+    #[test]
+    fn affects_orders_distribution_versions() {
+        let a = Advisory::from_json(UBUNTU).unwrap();
+        let eco = "Ubuntu:24.04:LTS";
+        assert_eq!(
+            a.affects(eco, "openssl", "3.0.13-0ubuntu3"),
+            Match::Affected
+        );
+        assert_eq!(
+            a.affects(eco, "openssl", "3.0.13-0ubuntu3.4"),
+            Match::Affected
+        );
+        // dpkg ordering, not string ordering: 3.10 > 3.5.
+        assert_eq!(
+            a.affects(eco, "openssl", "3.0.13-0ubuntu3.10"),
+            Match::NotAffected
+        );
+        assert_eq!(
+            a.affects(eco, "openssl", "3.0.13-0ubuntu3.5"),
+            Match::NotAffected
+        );
+        assert_eq!(
+            a.affects("Ubuntu:22.04:LTS", "openssl", "3.0.2-0ubuntu1"),
+            Match::NotAffected,
+            "another release"
+        );
+        assert_eq!(
+            a.affects(eco, "libssl3t64", "3.0.13-0ubuntu3"),
+            Match::NotAffected
+        );
+    }
+
+    #[test]
+    fn affects_rpm_and_last_affected() {
+        let a = Advisory::from_json(
+            r#"{"id":"ALSA-1","modified":"x","affected":[{"package":{"ecosystem":"AlmaLinux:9","name":"glibc"},
+            "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"last_affected":"2.34-60.el9"}]}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            a.affects("AlmaLinux:9", "glibc", "2.34-60.el9"),
+            Match::Affected
+        );
+        assert_eq!(
+            a.affects("AlmaLinux:9", "glibc", "2.34-8.el9"),
+            Match::Affected
+        );
+        assert_eq!(
+            a.affects("AlmaLinux:9", "glibc", "2.34-100.el9"),
+            Match::NotAffected
+        );
+    }
+
+    #[test]
+    fn affects_pypi_names_and_enumerated_versions() {
+        let a = Advisory::from_json(
+            r#"{"id":"PYSEC-1","modified":"x","affected":[{"package":{"ecosystem":"PyPI","name":"Django_Rest.Framework"},
+            "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"3.15.2"}]}],
+            "versions":["3.15.0","3.15.1"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            a.affects("PyPI", "django-rest-framework", "3.15.1"),
+            Match::Affected
+        );
+        assert_eq!(
+            a.affects("PyPI", "django-rest-framework", "3.14.0rc1"),
+            Match::Affected,
+            "range evaluated with PEP 440"
+        );
+        assert_eq!(
+            a.affects("PyPI", "django-rest-framework", "3.15.2"),
+            Match::NotAffected
+        );
+        // An unparsable version falls back to the enumeration.
+        assert_eq!(
+            a.affects("PyPI", "django-rest-framework", "weird"),
+            Match::NotAffected
+        );
+    }
+
+    #[test]
+    fn withdrawn_is_parsed() {
+        let a = Advisory::from_json(
+            r#"{"id":"GHSA-x","modified":"x","withdrawn":"2026-11-20T16:33:06Z"}"#,
+        )
+        .unwrap();
+        assert!(a.withdrawn.is_some());
     }
 }
