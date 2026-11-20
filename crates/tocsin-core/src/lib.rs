@@ -5,6 +5,7 @@
 //! * [`purl`]: the minimal Package URL handling needed to match advisories.
 //! * [`priority`]: effective priority computation (spec section 9.2).
 //! * [`policy`]: the administrator's reaction policy (spec section 9.3).
+//! * [`version`]: version ordering per ecosystem (dpkg, RPM, PEP 440, semver).
 
 pub mod advisory;
 pub mod cvss;
@@ -12,6 +13,7 @@ pub mod declaration;
 pub mod policy;
 pub mod priority;
 pub mod purl;
+pub mod version;
 
 /// Version of the Tocsin specification implemented by this crate.
 pub const SPEC_VERSION: &str = "0.1";

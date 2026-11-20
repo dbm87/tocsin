@@ -31,7 +31,7 @@ Le détail est dans la [spécification](spec/tocsin-v0.1.fr.md) (section 1 et su
 | [`examples/`](examples/) | Exemples de déclaration, d'avis et de politique, validés par les tests |
 | [`crates/tocsin-core`](crates/tocsin-core) | Bibliothèque Rust : formats de la spécification (déclaration, avis OSV avec l'extension Tocsin, purl, priorité effective, politique) |
 | [`crates/tocsin-inventory`](crates/tocsin-inventory) | Bibliothèque Rust : inventaire d'une machine Linux (composants, services, ports en écoute) |
-| [`crates/tocsin-sources`](crates/tocsin-sources) | Bibliothèque Rust : sources de repli, OSV.dev et catalogue KEV de la CISA |
+| [`crates/tocsin-sources`](crates/tocsin-sources) | Bibliothèque Rust : sources de repli, OSV.dev (API ou exports hors ligne) et catalogue KEV de la CISA |
 | [`crates/tocsin-agent`](crates/tocsin-agent) | Binaire `tocsin` : prototype de l'agent |
 
 ## Essayer le prototype
@@ -69,6 +69,7 @@ L'inventaire est en lecture seule et ne demande aucun service extérieur. Il rel
 cargo run -q -- scan --project /srv/mon-app                 # constats de priorité high et plus
 cargo run -q -- scan --min-priority low --format json       # tout, en JSON
 cargo run -q -- scan --policy examples/policy.toml          # décisions selon une politique
+cargo run -q -- scan --offline                              # sans rien envoyer à OSV.dev
 ```
 
 `tocsin scan` inventorie la machine, interroge [OSV.dev](https://osv.dev) puis le [catalogue KEV de la CISA](https://www.cisa.gov/known-exploited-vulnerabilities-catalog), et produit pour chaque faille : le paquet et sa version, les composants installés concernés, la version corrigée, les services qui l'utilisent avec leur exposition, la priorité effective (section 9.2 de la spécification) et la décision de la politique.
@@ -78,19 +79,29 @@ cargo run -q -- scan --policy examples/policy.toml          # décisions selon u
 - Une faille listée par le catalogue KEV passe en `critical`, quel que soit son classement d'origine.
 - Les bulletins qui regroupent plusieurs CVE (USN…) sont fusionnés avec les fiches par CVE.
 - Les avis et le catalogue sont mis en cache dans `~/.cache/tocsin` (catalogue KEV : 24 h).
-- **Confidentialité** : la requête à OSV.dev envoie les noms et versions des paquets. Le catalogue KEV, lui, est téléchargé en entier : rien ne sort de la machine pour cette partie. Un mode hors ligne, à partir des exports complets d'OSV, est prévu.
+- **Confidentialité** : par défaut, la requête à OSV.dev envoie les noms et versions des paquets. Avec `--offline`, rien ne part : voir ci-dessous. Le catalogue KEV est toujours téléchargé en entier, rien ne sort de la machine pour cette partie.
 - Les sources de repli ne sont jamais signées par l'éditeur : comme le veut la section 11 de la spécification, elles ne déclenchent jamais d'atténuation automatique.
+
+#### Mode hors ligne
+
+`tocsin scan --offline` compare l'inventaire aux [exports publics d'OSV](https://google.github.io/osv.dev/data/#data-dumps) sur la machine même. Seuls les noms des écosystèmes (`Ubuntu`, `crates.io`, `npm`…) sont visibles du serveur d'exports, jamais un nom de paquet ou une version.
+
+- Le premier passage télécharge l'export complet de chaque écosystème (`<écosystème>/all.zip` : environ 820 Mo pour Ubuntu, 220 Mo pour npm, 4 Mo pour crates.io), n'en garde que la release concernée (`Ubuntu:22.04:LTS`) et les champs utiles, et range le résultat dans `~/.cache/tocsin/osv-offline`. Les exports par release publiés par OSV ne sont plus mis à jour, d'où ce filtrage local.
+- Les passages suivants ne récupèrent que les fiches modifiées depuis (liste `modified_id.csv`), au plus une fois par heure (`--update-after` en minutes). Au-delà de 3 000 fiches modifiées, l'export complet est retéléchargé.
+- `--no-update` n'effectue aucun téléchargement : bases locales et catalogue KEV en cache, tels quels. Pour une machine sans réseau, copier le répertoire `osv-offline` (et `kev.json`) depuis une machine qui en a.
+- Si une mise à jour échoue, la base locale est utilisée et le rapport le signale, avec la date des données.
+- Les versions sont comparées localement selon les règles de chaque écosystème : dpkg pour Debian et Ubuntu, `rpmvercmp` pour les distributions RPM, PEP 440 pour PyPI, SemVer pour npm et crates.io. Les fiches retirées (`withdrawn`) sont ignorées.
 
 Limites actuelles : le contenu des conteneurs, Flatpak et Snap n'est pas encore inventorié (ces services sont signalés, sans leur attribuer à tort les paquets de l'hôte) ; sans droits root, les processus des autres utilisateurs ne sont que partiellement inspectés.
 
 Ce que fait déjà le prototype :
 
 - lecture des déclarations dans `package.json`, `tocsin.json`, `Cargo.toml` et `pyproject.toml`, avec les règles de la section 5 (HTTPS obligatoire, champs inconnus refusés) ;
-- lecture des avis OSV et de l'extension `tocsin`, comparaison des plages de versions SEMVER ;
+- lecture des avis OSV et de l'extension `tocsin`, comparaison des plages de versions (SemVer, dpkg, RPM, PEP 440) ;
 - calcul de la priorité effective (section 9.2) ;
 - application de la politique (section 9.3), avec un garde-fou : un avis non signé n'est jamais atténué automatiquement.
 
-Pas encore fait : vérification des signatures Sigstore, registre persistant, contenu des conteneurs, connexion aux relais, score EPSS, mode hors ligne pour OSV, adaptateurs d'atténuation. Voir la feuille de route (section 12.2 de la spécification).
+Pas encore fait : vérification des signatures Sigstore, registre persistant, contenu des conteneurs, connexion aux relais, score EPSS, adaptateurs d'atténuation. Voir la feuille de route (section 12.2 de la spécification).
 
 ## Licences
 

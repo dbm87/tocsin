@@ -74,6 +74,14 @@ impl Catalog {
         self.entries.is_empty()
     }
 
+    /// The cached catalog whatever its age, without any download. It is
+    /// marked stale when older than `max_age`.
+    pub fn from_cache(cache: &Cache, max_age: Duration) -> Option<Self> {
+        let mut catalog = Catalog::from_json(&cache.get(CACHE_KEY)?).ok()?;
+        catalog.stale = cache.age(CACHE_KEY).is_none_or(|age| age >= max_age);
+        Some(catalog)
+    }
+
     /// The catalog from the cache if younger than `max_age`, else downloaded.
     /// When the download fails, an older cached copy is used and marked stale.
     pub fn load(agent: &ureq::Agent, cache: Option<&Cache>, max_age: Duration) -> Result<Self> {

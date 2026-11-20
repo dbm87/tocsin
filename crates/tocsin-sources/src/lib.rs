@@ -1,11 +1,13 @@
 //! Fallback vulnerability sources (spec section 11): OSV.dev for advisories,
 //! the CISA KEV catalog for known exploitation.
 //!
-//! Privacy: querying OSV.dev sends package names and versions. The KEV catalog
+//! Privacy: querying OSV.dev sends package names and versions; the [`offline`]
+//! mode avoids it by matching the public OSV exports locally. The KEV catalog
 //! is downloaded whole, so nothing about the machine leaves it for that part.
 
 pub mod cache;
 pub mod kev;
+pub mod offline;
 pub mod osv;
 
 use std::time::Duration;
