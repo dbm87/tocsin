@@ -451,7 +451,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde_json",
  "tocsin-core",
+ "tocsin-inventory",
 ]
 
 [[package]]
@@ -464,6 +466,16 @@ dependencies = [
  "thiserror",
  "toml",
  "url",
+]
+
+[[package]]
+name = "tocsin-inventory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tocsin-core",
+ "toml",
 ]
 
 [[package]]
