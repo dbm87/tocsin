@@ -31,6 +31,7 @@ Le détail est dans la [spécification](spec/tocsin-v0.1.fr.md) (section 1 et su
 | [`examples/`](examples/) | Exemples de déclaration, d'avis et de politique, validés par les tests |
 | [`crates/tocsin-core`](crates/tocsin-core) | Bibliothèque Rust : formats de la spécification (déclaration, avis OSV avec l'extension Tocsin, purl, priorité effective, politique) |
 | [`crates/tocsin-inventory`](crates/tocsin-inventory) | Bibliothèque Rust : inventaire d'une machine Linux (composants, services, ports en écoute) |
+| [`crates/tocsin-sources`](crates/tocsin-sources) | Bibliothèque Rust : sources de repli, OSV.dev et catalogue KEV de la CISA |
 | [`crates/tocsin-agent`](crates/tocsin-agent) | Binaire `tocsin` : prototype de l'agent |
 
 ## Essayer le prototype
@@ -62,6 +63,24 @@ L'inventaire est en lecture seule et ne demande aucun service extérieur. Il rel
 - les **ports en écoute** et leur exposition (boucle locale, réseau local, toutes interfaces, adresse publique), dans chaque espace de noms réseau, conteneurs compris ;
 - les **redémarrages nécessaires** : un service qui exécute encore une bibliothèque remplacée sur le disque par une mise à jour reste vulnérable tant qu'il n'est pas redémarré.
 
+### Croiser l'inventaire avec les failles connues
+
+```sh
+cargo run -q -- scan --project /srv/mon-app                 # constats de priorité high et plus
+cargo run -q -- scan --min-priority low --format json       # tout, en JSON
+cargo run -q -- scan --policy examples/policy.toml          # décisions selon une politique
+```
+
+`tocsin scan` inventorie la machine, interroge [OSV.dev](https://osv.dev) puis le [catalogue KEV de la CISA](https://www.cisa.gov/known-exploited-vulnerabilities-catalog), et produit pour chaque faille : le paquet et sa version, les composants installés concernés, la version corrigée, les services qui l'utilisent avec leur exposition, la priorité effective (section 9.2 de la spécification) et la décision de la politique.
+
+- Les paquets de distribution sont interrogés par **paquet source** et pour la **release exacte** (`Ubuntu:26.04:LTS`, `Debian:12`…), comme les distributions publient leurs avis ; les dépendances applicatives, par purl.
+- La gravité vient du classement de la distribution ou de GitHub, sinon du score CVSS 3 calculé à partir du vecteur.
+- Une faille listée par le catalogue KEV passe en `critical`, quel que soit son classement d'origine.
+- Les bulletins qui regroupent plusieurs CVE (USN…) sont fusionnés avec les fiches par CVE.
+- Les avis et le catalogue sont mis en cache dans `~/.cache/tocsin` (catalogue KEV : 24 h).
+- **Confidentialité** : la requête à OSV.dev envoie les noms et versions des paquets. Le catalogue KEV, lui, est téléchargé en entier : rien ne sort de la machine pour cette partie. Un mode hors ligne, à partir des exports complets d'OSV, est prévu.
+- Les sources de repli ne sont jamais signées par l'éditeur : comme le veut la section 11 de la spécification, elles ne déclenchent jamais d'atténuation automatique.
+
 Limites actuelles : le contenu des conteneurs, Flatpak et Snap n'est pas encore inventorié (ces services sont signalés, sans leur attribuer à tort les paquets de l'hôte) ; sans droits root, les processus des autres utilisateurs ne sont que partiellement inspectés.
 
 Ce que fait déjà le prototype :
@@ -71,7 +90,7 @@ Ce que fait déjà le prototype :
 - calcul de la priorité effective (section 9.2) ;
 - application de la politique (section 9.3), avec un garde-fou : un avis non signé n'est jamais atténué automatiquement.
 
-Pas encore fait : vérification des signatures Sigstore, registre persistant, contenu des conteneurs, connexion aux relais, repli OSV.dev et CISA KEV, adaptateurs d'atténuation. Voir la feuille de route (section 12.2 de la spécification).
+Pas encore fait : vérification des signatures Sigstore, registre persistant, contenu des conteneurs, connexion aux relais, score EPSS, mode hors ligne pour OSV, adaptateurs d'atténuation. Voir la feuille de route (section 12.2 de la spécification).
 
 ## Licences
 

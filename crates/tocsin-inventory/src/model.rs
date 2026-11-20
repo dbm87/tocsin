@@ -18,6 +18,17 @@ pub struct Host {
     pub hostname: Option<String>,
     pub os_id: Option<String>,
     pub os_version: Option<String>,
+    /// OSV.dev ecosystem of the system packages, e.g. `Ubuntu:26.04:LTS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osv_ecosystem: Option<String>,
+}
+
+/// The source package a binary package was built from. Distributions publish
+/// advisories per source package (`openssl`), not per binary (`libssl3t64`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourcePackage {
+    pub name: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -29,6 +40,8 @@ pub struct Component {
     pub origin: Origin,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration: Option<Declaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourcePackage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

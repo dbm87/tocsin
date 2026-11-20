@@ -63,8 +63,10 @@ pub fn collect(options: &Options) -> Inventory {
         .map(|text| system::parse_os_release(&text))
         .unwrap_or_default();
     let distro = os.id.clone().unwrap_or_else(|| "linux".into());
+    let osv_ecosystem = os.osv_ecosystem();
     let host = Host {
         hostname: read_trimmed(&options.proc_root.join("sys/kernel/hostname")),
+        osv_ecosystem,
         os_id: os.id,
         os_version: os.version_id,
     };
@@ -520,6 +522,7 @@ mod tests {
                     file: "/srv/app/package-lock.json".into(),
                 },
                 declaration: None,
+                source: None,
             }],
             warnings: Vec::new(),
         };

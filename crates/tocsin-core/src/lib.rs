@@ -7,6 +7,7 @@
 //! * [`policy`]: the administrator's reaction policy (spec section 9.3).
 
 pub mod advisory;
+pub mod cvss;
 pub mod declaration;
 pub mod policy;
 pub mod priority;
