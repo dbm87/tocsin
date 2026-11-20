@@ -6,6 +6,23 @@ Chaque logiciel déclare, dès son installation, le canal où son éditeur publi
 
 > État : brouillon v0.1 de la spécification et premier prototype de l'agent. Rien n'est stable.
 
+## Résumé et motivation
+
+Tocsin permet à chaque logiciel de déclarer, dès son installation, où publier ses alertes de sécurité. Un agent local s'y abonne, reçoit l'alerte en quelques secondes et réagit selon une politique fixée par l'administrateur. L'objectif est de défendre à vitesse machine, et plus à vitesse humaine.
+
+**Le problème.** Une faille critique publiée peut désormais être exploitée en masse en quelques minutes, par des attaquants équipés d'agents IA qui lisent l'avis, écrivent l'exploit et balayent Internet. En face, la chaîne de défense reste humaine : lire une liste de diffusion, comprendre si l'on est concerné, trouver la machine, corriger.
+
+**Ce qui manque aujourd'hui.**
+
+- Aucun lien standard entre un logiciel installé et le canal où son éditeur publie ses alertes.
+- Aucune machine ne sait, de façon lisible, quels composants elle fait tourner et quel service les utilise.
+- Les avis décrivent la faille, rarement une parade applicable automatiquement.
+- Les outils actuels (scanners, bases de failles) sont consultés périodiquement : l'information est tirée, pas poussée.
+
+**Ce que Tocsin apporte.** Une couche fine au-dessus des standards existants (purl, OSV, CSAF, VEX, CycloneDX, WebSub, Sigstore) qui définit quatre choses : la déclaration du canal, le registre local, le protocole de l'agent et un format d'atténuation lisible par machine.
+
+Le détail est dans la [spécification](spec/tocsin-v0.1.fr.md) (section 1 et suivantes).
+
 ## Contenu du dépôt
 
 | Chemin | Contenu |
