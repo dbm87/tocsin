@@ -14,6 +14,19 @@ pub enum Urgency {
 }
 
 impl Urgency {
+    /// Reads the textual ratings found in advisories: Tocsin's own levels,
+    /// distribution ratings (Ubuntu "negligible", Red Hat "important"…) and
+    /// GitHub's ("MODERATE"). Case-insensitive.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "negligible" | "low" | "minor" => Some(Urgency::Low),
+            "medium" | "moderate" => Some(Urgency::Medium),
+            "high" | "important" => Some(Urgency::High),
+            "critical" => Some(Urgency::Critical),
+            _ => None,
+        }
+    }
+
     /// One level up, capped at `Critical`.
     pub fn raise(self) -> Self {
         match self {

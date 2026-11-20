@@ -1,19 +1,25 @@
 //! `tocsin`: command-line entry point of the reference agent.
 //!
-//! It validates the formats of the specification, inventories a Linux machine
-//! and evaluates one advisory against one component. Relays and fallback
-//! sources come next (spec roadmap, step 2).
+//! It validates the formats of the specification, inventories a Linux machine,
+//! evaluates one advisory against one component, and scans the machine against
+//! fallback sources (OSV.dev, CISA KEV). Relays come next.
+
+mod scan;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tocsin_core::advisory::Match;
 use tocsin_core::policy::Context;
 use tocsin_core::{
     Action, Advisory, Declaration, Exposure, Mitigation, Policy, Purl, Signals, effective_priority,
 };
+use tocsin_sources::cache::Cache;
+use tocsin_sources::{kev, osv};
 
 #[derive(Parser)]
 #[command(name = "tocsin", version, about = "Tocsin reference agent (prototype)")]
@@ -33,6 +39,63 @@ enum Command {
     Check(CheckArgs),
     /// Inventory this Linux machine: components, services, listening ports.
     Inventory(InventoryArgs),
+    /// Inventory this machine, then look its components up in OSV.dev and the
+    /// CISA KEV catalog. Package names and versions are sent to OSV.dev.
+    Scan(ScanArgs),
+}
+
+#[derive(Args)]
+struct ScanArgs {
+    /// Project directory whose lockfiles are read (repeatable).
+    #[arg(long = "project", value_name = "DIR")]
+    projects: Vec<PathBuf>,
+    /// Policy file; the built-in notify-only policy when absent.
+    #[arg(long)]
+    policy: Option<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = ScanFormat::Summary)]
+    format: ScanFormat,
+    /// Lowest priority listed in the summary.
+    #[arg(long, value_enum, default_value_t = MinPriority::High)]
+    min_priority: MinPriority,
+    /// Cache directory (default: ~/.cache/tocsin).
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+    /// Do not read or write the cache.
+    #[arg(long)]
+    no_cache: bool,
+    /// Parallel downloads of advisories.
+    #[arg(long, default_value_t = 16)]
+    workers: usize,
+    #[arg(long, default_value = "/", hide = true)]
+    fs_root: PathBuf,
+    #[arg(long, default_value = "/proc", hide = true)]
+    proc_root: PathBuf,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ScanFormat {
+    Summary,
+    Json,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MinPriority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl From<MinPriority> for tocsin_core::Urgency {
+    fn from(value: MinPriority) -> Self {
+        match value {
+            MinPriority::Low => tocsin_core::Urgency::Low,
+            MinPriority::Medium => tocsin_core::Urgency::Medium,
+            MinPriority::High => tocsin_core::Urgency::High,
+            MinPriority::Critical => tocsin_core::Urgency::Critical,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -242,6 +305,241 @@ fn inventory(args: InventoryArgs) -> Result<()> {
     Ok(())
 }
 
+fn scan_command(args: ScanArgs) -> Result<()> {
+    let policy = match &args.policy {
+        Some(path) => Policy::from_toml(&read(path)?)?,
+        None => Policy::default_policy(),
+    };
+    let inventory = tocsin_inventory::collect(&tocsin_inventory::Options {
+        fs_root: args.fs_root,
+        proc_root: args.proc_root,
+        projects: args.projects,
+        rpm: true,
+    });
+    let plan = scan::plan(&inventory);
+    let cache = if args.no_cache {
+        None
+    } else {
+        args.cache_dir.or_else(Cache::default_dir).map(Cache::new)
+    };
+    let agent = tocsin_sources::http_agent();
+    let client = osv::Client::new(agent.clone(), cache.clone());
+
+    eprintln!(
+        "querying OSV.dev for {} package(s): their names and versions are sent to api.osv.dev",
+        plan.queries.len()
+    );
+    let matches = client.query_batch(&plan.queries)?;
+    let mut unique: Vec<osv::VulnRef> = matches.iter().flatten().cloned().collect();
+    unique.sort_by(|a, b| a.id.cmp(&b.id));
+    unique.dedup_by(|a, b| a.id == b.id);
+
+    eprintln!("fetching {} advisorie(s)", unique.len());
+    let reported = AtomicUsize::new(0);
+    let progress = |done: usize, total: usize| {
+        let tenth = done * 10 / total.max(1);
+        if tenth > reported.fetch_max(tenth, Ordering::Relaxed) {
+            eprintln!("  {}%", tenth * 10);
+        }
+    };
+    let (fetched, errors) = client.fetch_all(&unique, args.workers, &progress);
+    let advisories: HashMap<String, Advisory> =
+        fetched.into_iter().map(|a| (a.id.clone(), a)).collect();
+
+    let kev = kev::Catalog::load(&agent, cache.as_ref(), Duration::from_secs(24 * 3600))
+        .unwrap_or_else(|error| {
+            eprintln!("warning: {error:#}; continuing without the KEV catalog");
+            kev::Catalog::default()
+        });
+    if kev.stale {
+        eprintln!("warning: KEV catalog download failed, using an older cached copy");
+    }
+
+    let findings = scan::correlate(&inventory, &plan, &matches, &advisories, &kev, &policy);
+    let mut warnings = inventory.warnings.clone();
+    if plan.unsupported > 0 {
+        warnings.push(format!(
+            "{} system package(s) not looked up: OSV.dev has no data for this distribution ({})",
+            plan.unsupported,
+            inventory.host.os_id.as_deref().unwrap_or("unknown")
+        ));
+    }
+    if !errors.is_empty() {
+        warnings.push(format!(
+            "{} advisorie(s) could not be fetched, first: {}",
+            errors.len(),
+            errors[0]
+        ));
+    }
+
+    match args.format {
+        ScanFormat::Json => {
+            let report = serde_json::json!({
+                "host": inventory.host,
+                "components": inventory.components.len(),
+                "queries": plan.queries.len(),
+                "advisories": advisories.len(),
+                "kev_catalog": kev.version,
+                "findings": findings,
+                "warnings": warnings,
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        ScanFormat::Summary => print_scan_summary(
+            &inventory,
+            &plan,
+            &findings,
+            &kev,
+            &warnings,
+            args.min_priority.into(),
+        ),
+    }
+    Ok(())
+}
+
+fn print_scan_summary(
+    inventory: &tocsin_inventory::model::Inventory,
+    plan: &scan::Plan,
+    findings: &[scan::Finding],
+    kev: &kev::Catalog,
+    warnings: &[String],
+    min_priority: tocsin_core::Urgency,
+) {
+    use tocsin_core::Urgency;
+
+    println!(
+        "host: {} ({})",
+        inventory.host.hostname.as_deref().unwrap_or("?"),
+        inventory
+            .host
+            .osv_ecosystem
+            .as_deref()
+            .unwrap_or("no OSV ecosystem")
+    );
+    println!(
+        "scanned {} component(s) in {} OSV quer(ies); KEV catalog {} ({} entries)",
+        inventory.components.len(),
+        plan.queries.len(),
+        kev.version.as_deref().unwrap_or("unavailable"),
+        kev.len()
+    );
+    let count = |urgency: Urgency| findings.iter().filter(|f| f.priority == urgency).count();
+    let in_kev = findings.iter().filter(|f| f.kev.is_some()).count();
+    let exposed = findings
+        .iter()
+        .filter(|f| {
+            f.widest_exposure()
+                .is_some_and(|e| e.to_policy() == Exposure::Internet)
+        })
+        .count();
+    println!(
+        "findings: {} (critical {}, high {}, medium {}, low {}); {in_kev} in KEV; {exposed} on services listening on all interfaces or a public address",
+        findings.len(),
+        count(Urgency::Critical),
+        count(Urgency::High),
+        count(Urgency::Medium),
+        count(Urgency::Low)
+    );
+
+    let shown: Vec<_> = findings
+        .iter()
+        .filter(|f| f.priority >= min_priority)
+        .collect();
+    println!(
+        "showing priority {min_priority} and above: {} finding(s)",
+        shown.len()
+    );
+    for finding in shown {
+        let advisories = std::iter::once(&finding.advisory)
+            .chain(&finding.related)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let title = if finding.cves.is_empty() {
+            advisories
+        } else {
+            format!("{} ({advisories})", finding.cves.join(", "))
+        };
+        let kev_note = match &finding.kev {
+            Some(entry) if entry.used_by_ransomware() => {
+                format!("  [KEV since {}, ransomware]", entry.date_added)
+            }
+            Some(entry) => format!("  [KEV since {}]", entry.date_added),
+            None => String::new(),
+        };
+        println!(
+            "\n{:<9}{title}{kev_note}",
+            finding.priority.to_string().to_uppercase()
+        );
+
+        let mut components = finding
+            .components
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if finding.components.len() > 4 {
+            components.push_str(&format!(" and {} more", finding.components.len() - 4));
+        }
+        let fixed = if finding.fixed_in.is_empty() {
+            "no fixed version listed".to_owned()
+        } else {
+            format!("fixed in {}", finding.fixed_in.join(", "))
+        };
+        println!(
+            "  {} {} -> {components} · {fixed}",
+            finding.package, finding.version
+        );
+        if let Some(summary) = &finding.summary {
+            let short: String = summary.chars().take(110).collect();
+            println!(
+                "  {short}{}",
+                if summary.chars().count() > 110 {
+                    "…"
+                } else {
+                    ""
+                }
+            );
+        }
+        if finding.services.is_empty() {
+            println!("  not used by a running service");
+        } else {
+            let used: Vec<String> = finding
+                .services
+                .iter()
+                .take(3)
+                .map(|s| match s.exposure {
+                    Some(e) => format!("{} ({})", s.name, exposure_label(e)),
+                    None => s.name.clone(),
+                })
+                .collect();
+            let more = finding.services.len().saturating_sub(3);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            println!("  used by {}{more}", used.join(", "));
+        }
+        let stated = finding
+            .stated_urgency
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "none".into());
+        println!(
+            "  advisory severity: {stated} · policy: {}",
+            format!("{:?}", finding.action).to_lowercase()
+        );
+    }
+
+    if !warnings.is_empty() {
+        println!();
+        for warning in warnings {
+            println!("warning: {warning}");
+        }
+    }
+}
+
 fn exposure_label(exposure: tocsin_inventory::Exposure) -> &'static str {
     match exposure {
         tocsin_inventory::Exposure::Loopback => "loopback only",
@@ -407,6 +705,7 @@ fn main() -> ExitCode {
         Command::Validate { what } => validate(what),
         Command::Check(args) => check(args),
         Command::Inventory(args) => inventory(args),
+        Command::Scan(args) => scan_command(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

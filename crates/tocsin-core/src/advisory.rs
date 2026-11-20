@@ -19,10 +19,25 @@ pub struct Advisory {
     pub published: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Upstream identifiers the advisory derives from (e.g. the CVE behind a
+    /// distribution advisory).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub severity: Vec<Severity>,
     #[serde(default)]
     pub affected: Vec<Affected>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_specific: Option<DatabaseSpecific>,
+}
+
+/// An OSV severity entry: `{"type": "CVSS_V3", "score": "CVSS:3.1/…"}`, or a
+/// distribution's own rating such as `{"type": "Ubuntu", "score": "medium"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Severity {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub score: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -189,6 +204,77 @@ impl Advisory {
         self.database_specific.as_ref()?.tocsin.as_ref()
     }
 
+    /// CVE identifiers of this advisory: its own id, aliases and upstream ids.
+    pub fn cve_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = std::iter::once(&self.id)
+            .chain(&self.aliases)
+            .chain(&self.upstream)
+            .map(String::as_str)
+            .filter(|id| id.starts_with("CVE-"))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// The first CVSS v3 vector of the advisory, parsed.
+    pub fn cvss_v3(&self) -> Option<crate::cvss::CvssV3> {
+        self.severity
+            .iter()
+            .filter(|s| s.kind == "CVSS_V3")
+            .find_map(|s| crate::cvss::CvssV3::parse(&s.score))
+    }
+
+    /// Urgency stated or implied by the advisory, in order of preference: the
+    /// Tocsin extension, a textual rating (distribution, GitHub), then the
+    /// CVSS v3 base score. `None` when the advisory gives no severity at all.
+    pub fn stated_urgency(&self) -> Option<Urgency> {
+        if let Some(ext) = self.tocsin() {
+            return Some(ext.urgency);
+        }
+        let textual = self
+            .severity
+            .iter()
+            .filter(|s| !s.kind.starts_with("CVSS"))
+            .find_map(|s| Urgency::from_label(&s.score))
+            .or_else(|| {
+                let other = &self.database_specific.as_ref()?.other;
+                Urgency::from_label(other.get("severity")?.as_str()?)
+            });
+        textual.or_else(|| self.cvss_v3().map(|cvss| cvss.urgency()))
+    }
+
+    /// Exploitable remotely: stated by the Tocsin extension, or `AV:N` in CVSS.
+    pub fn network_reachable(&self) -> bool {
+        self.tocsin().is_some_and(|ext| ext.network_reachable)
+            || self.cvss_v3().is_some_and(|cvss| cvss.network)
+    }
+
+    /// Versions fixing the advisory for a package, by OSV package name and,
+    /// when given, ecosystem: a distribution advisory lists every release,
+    /// and another release's fix does not apply.
+    pub fn fixed_versions(&self, package_name: &str, ecosystem: Option<&str>) -> Vec<&str> {
+        let mut fixed: Vec<&str> = self
+            .affected
+            .iter()
+            .filter(|a| {
+                a.package.as_ref().is_some_and(|p| {
+                    p.name.as_deref() == Some(package_name)
+                        && ecosystem.is_none_or(|e| p.ecosystem.as_deref() == Some(e))
+                })
+            })
+            .flat_map(|a| &a.ranges)
+            .flat_map(|r| &r.events)
+            .filter_map(|event| match event {
+                Event::Fixed(version) => Some(version.as_str()),
+                _ => None,
+            })
+            .collect();
+        fixed.sort_unstable();
+        fixed.dedup();
+        fixed
+    }
+
     /// Does this advisory affect the given component (purl with a version)?
     pub fn matches(&self, component: &Purl) -> Match {
         let mut result = Match::NotAffected;
@@ -345,5 +431,55 @@ mod tests {
             Advisory::from_json(json),
             Err(AdvisoryError::EmptyField("id"))
         ));
+    }
+
+    // Shapes taken from real OSV.dev records.
+    const UBUNTU: &str = r#"{"id":"UBUNTU-CVE-2024-13176","modified":"2026-01-01T00:00:00Z",
+        "upstream":["CVE-2024-13176"],
+        "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"},{"type":"Ubuntu","score":"low"}],
+        "affected":[{"package":{"ecosystem":"Ubuntu:24.04:LTS","name":"openssl"},
+            "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"3.0.13-0ubuntu3.5"}]}]}]}"#;
+    const GHSA: &str = r#"{"id":"GHSA-29mw-wpgm-hmr9","modified":"2026-01-01T00:00:00Z",
+        "aliases":["CVE-2020-28500"],
+        "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"}],
+        "database_specific":{"severity":"MODERATE","github_reviewed":true}}"#;
+
+    #[test]
+    fn distribution_rating_is_preferred_to_cvss() {
+        let a = Advisory::from_json(UBUNTU).unwrap();
+        assert_eq!(a.cve_ids(), ["CVE-2024-13176"]);
+        // CVSS alone would say medium (4.6); Ubuntu rates it low in context.
+        assert_eq!(a.stated_urgency(), Some(Urgency::Low));
+        assert!(!a.network_reachable());
+        assert_eq!(a.fixed_versions("openssl", None), ["3.0.13-0ubuntu3.5"]);
+        assert_eq!(
+            a.fixed_versions("openssl", Some("Ubuntu:24.04:LTS")),
+            ["3.0.13-0ubuntu3.5"]
+        );
+        assert!(
+            a.fixed_versions("openssl", Some("Ubuntu:22.04:LTS"))
+                .is_empty()
+        );
+        assert!(a.fixed_versions("libssl3t64", None).is_empty());
+    }
+
+    #[test]
+    fn github_rating_and_network_vector() {
+        let a = Advisory::from_json(GHSA).unwrap();
+        assert_eq!(a.cve_ids(), ["CVE-2020-28500"]);
+        assert_eq!(a.stated_urgency(), Some(Urgency::Medium));
+        assert!(a.network_reachable());
+    }
+
+    #[test]
+    fn cvss_only_and_no_severity() {
+        let cvss_only = r#"{"id":"RUSTSEC-2020-0071","modified":"x","aliases":["CVE-2020-26235"],
+            "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}"#;
+        assert_eq!(
+            Advisory::from_json(cvss_only).unwrap().stated_urgency(),
+            Some(Urgency::Critical)
+        );
+        let none = r#"{"id":"X-1","modified":"x"}"#;
+        assert_eq!(Advisory::from_json(none).unwrap().stated_urgency(), None);
     }
 }

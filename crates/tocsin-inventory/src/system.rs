@@ -1,6 +1,6 @@
 //! System package databases: dpkg (Debian, Ubuntu…) and rpm (Fedora, RHEL, SUSE…).
 
-use crate::model::{Component, Origin};
+use crate::model::{Component, Origin, SourcePackage};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -10,6 +10,30 @@ use std::process::Command;
 pub struct OsRelease {
     pub id: Option<String>,
     pub version_id: Option<String>,
+    /// Human-readable version, e.g. "26.04.1 LTS (Resolute Raccoon)".
+    pub version: Option<String>,
+}
+
+impl OsRelease {
+    /// The OSV.dev ecosystem of this distribution's packages, e.g.
+    /// `Ubuntu:26.04:LTS` or `Debian:12`. `None` when OSV has no data for it.
+    pub fn osv_ecosystem(&self) -> Option<String> {
+        let version_id = self.version_id.as_deref()?;
+        let major = version_id.split('.').next().unwrap_or(version_id);
+        match self.id.as_deref()? {
+            "ubuntu" => {
+                let lts = self.version.as_deref().is_some_and(|v| v.contains("LTS"));
+                Some(format!(
+                    "Ubuntu:{version_id}{}",
+                    if lts { ":LTS" } else { "" }
+                ))
+            }
+            "debian" => Some(format!("Debian:{major}")),
+            "almalinux" => Some(format!("AlmaLinux:{major}")),
+            "rocky" => Some(format!("Rocky Linux:{major}")),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_os_release(text: &str) -> OsRelease {
@@ -22,6 +46,7 @@ pub fn parse_os_release(text: &str) -> OsRelease {
         match key.trim() {
             "ID" => os.id = Some(value),
             "VERSION_ID" => os.version_id = Some(value),
+            "VERSION" => os.version = Some(value),
             _ => {}
         }
     }
@@ -34,6 +59,8 @@ pub struct Package {
     pub name: String,
     pub version: String,
     pub arch: Option<String>,
+    /// Source package, when it differs from the binary package (dpkg `Source:`).
+    pub source: Option<SourcePackage>,
 }
 
 impl Package {
@@ -49,7 +76,27 @@ impl Package {
             version: self.version,
             origin,
             declaration: None,
+            source: self.source,
         }
+    }
+}
+
+/// Parses a dpkg `Source:` field, `openssl` or `openssl (3.0.13-0ubuntu3)`.
+/// Without an explicit version, the source has the binary package's version.
+fn parse_dpkg_source(value: &str, binary_version: &str) -> SourcePackage {
+    match value.split_once(' ') {
+        Some((name, version)) => SourcePackage {
+            name: name.to_owned(),
+            version: version
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .to_owned(),
+        },
+        None => SourcePackage {
+            name: value.to_owned(),
+            version: binary_version.to_owned(),
+        },
     }
 }
 
@@ -58,6 +105,7 @@ pub fn parse_dpkg_status(text: &str) -> Vec<Package> {
     let mut packages = Vec::new();
     for paragraph in text.split("\n\n") {
         let (mut name, mut version, mut arch, mut installed) = (None, None, None, false);
+        let mut source: Option<String> = None;
         for line in paragraph.lines() {
             if line.starts_with([' ', '\t']) {
                 continue; // continuation of a multi-line field
@@ -70,15 +118,18 @@ pub fn parse_dpkg_status(text: &str) -> Vec<Package> {
                 "Package" => name = Some(value.to_owned()),
                 "Version" => version = Some(value.to_owned()),
                 "Architecture" => arch = Some(value.to_owned()),
+                "Source" => source = Some(value.to_owned()),
                 "Status" => installed = value.split_whitespace().nth(2) == Some("installed"),
                 _ => {}
             }
         }
         if let (true, Some(name), Some(version)) = (installed, name, version) {
+            let source = source.map(|s| parse_dpkg_source(&s, &version));
             packages.push(Package {
                 name,
                 version,
                 arch,
+                source,
             });
         }
     }
@@ -134,6 +185,7 @@ pub fn parse_rpm_packages(output: &str) -> Vec<Package> {
                 name: name.to_owned(),
                 version,
                 arch: arch.map(str::to_owned),
+                source: None,
             })
         })
         .collect()
@@ -176,9 +228,40 @@ mod tests {
 
     #[test]
     fn os_release() {
-        let os = parse_os_release("NAME=\"Ubuntu\"\nID=ubuntu\nVERSION_ID=\"26.04\"\n");
+        let os = parse_os_release(
+            "NAME=\"Ubuntu\"\nID=ubuntu\nVERSION_ID=\"26.04\"\nVERSION=\"26.04.1 LTS (Resolute Raccoon)\"\n",
+        );
         assert_eq!(os.id.as_deref(), Some("ubuntu"));
         assert_eq!(os.version_id.as_deref(), Some("26.04"));
+        assert_eq!(os.osv_ecosystem().as_deref(), Some("Ubuntu:26.04:LTS"));
+    }
+
+    #[test]
+    fn osv_ecosystems() {
+        let os = |id: &str, version_id: &str, version: &str| OsRelease {
+            id: Some(id.into()),
+            version_id: Some(version_id.into()),
+            version: Some(version.into()),
+        };
+        assert_eq!(
+            os("ubuntu", "25.10", "25.10 (Questing Quokka)")
+                .osv_ecosystem()
+                .as_deref(),
+            Some("Ubuntu:25.10")
+        );
+        assert_eq!(
+            os("debian", "12", "12 (bookworm)")
+                .osv_ecosystem()
+                .as_deref(),
+            Some("Debian:12")
+        );
+        assert_eq!(
+            os("rocky", "9.4", "9.4 (Blue Onyx)")
+                .osv_ecosystem()
+                .as_deref(),
+            Some("Rocky Linux:9")
+        );
+        assert_eq!(os("gentoo", "2.15", "").osv_ecosystem(), None);
     }
 
     #[test]
@@ -187,6 +270,7 @@ mod tests {
 Package: libssl3t64
 Status: install ok installed
 Architecture: amd64
+Source: openssl
 Version: 3.0.13-0ubuntu3
 Description: Secure Sockets Layer toolkit
  multi-line description
@@ -202,6 +286,21 @@ Version: 1:1.24.0-2ubuntu7
 ";
         let packages = parse_dpkg_status(status);
         assert_eq!(packages.len(), 2);
+        assert_eq!(
+            packages[0].source,
+            Some(SourcePackage {
+                name: "openssl".into(),
+                version: "3.0.13-0ubuntu3".into()
+            })
+        );
+        assert_eq!(packages[1].source, None);
+        assert_eq!(
+            parse_dpkg_source("glibc (2.39-0ubuntu8)", "1:2.39"),
+            SourcePackage {
+                name: "glibc".into(),
+                version: "2.39-0ubuntu8".into()
+            }
+        );
         let component = packages[1]
             .clone()
             .into_component("deb", "ubuntu", Origin::Dpkg);

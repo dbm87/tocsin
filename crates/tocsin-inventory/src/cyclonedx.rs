@@ -101,6 +101,7 @@ mod tests {
                 hostname: Some("srv-web-01".into()),
                 os_id: Some("ubuntu".into()),
                 os_version: None,
+                osv_ecosystem: None,
             },
             components: vec![Component {
                 purl: "pkg:deb/ubuntu/nginx@1.24".into(),
@@ -108,6 +109,7 @@ mod tests {
                 version: "1.24".into(),
                 origin: Origin::Dpkg,
                 declaration: None,
+                source: None,
             }],
             services: vec![Service {
                 id: "systemd:nginx.service".into(),

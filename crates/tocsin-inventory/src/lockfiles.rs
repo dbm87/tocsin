@@ -103,6 +103,7 @@ pub fn parse_npm_lock(text: &str, root: &Path, file: &Path) -> Result<Vec<Compon
                 file: file.to_owned(),
             },
             declaration,
+            source: None,
         });
     }
     Ok(components)
@@ -136,6 +137,7 @@ pub fn parse_cargo_lock(text: &str, file: &Path) -> Result<Vec<Component>, Strin
                 file: file.to_owned(),
             },
             declaration: None,
+            source: None,
         })
         .collect())
 }
@@ -154,6 +156,7 @@ pub fn parse_poetry_lock(text: &str, file: &Path) -> Result<Vec<Component>, Stri
                     file: file.to_owned(),
                 },
                 declaration: None,
+                source: None,
             }
         })
         .collect())
