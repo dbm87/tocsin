@@ -1,0 +1,17 @@
+[package]
+name = "tocsin-agent"
+description = "Tocsin reference agent (early prototype)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tocsin"
+path = "src/main.rs"
+
+[dependencies]
+tocsin-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true

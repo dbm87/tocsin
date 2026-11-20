@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.6.0",
+  "id": "EXAMPLE-2026-0042",
+  "aliases": ["CVE-2026-12345"],
+  "modified": "2026-11-20T08:14:00Z",
+  "published": "2026-11-20T08:00:00Z",
+  "summary": "Exécution de code à distance via le module d'import",
+  "affected": [{
+    "package": { "purl": "pkg:npm/example-widget" },
+    "ranges": [{ "type": "SEMVER", "events": [{ "introduced": "2.0.0" }, { "fixed": "2.4.7" }] }]
+  }],
+  "database_specific": {
+    "tocsin": {
+      "urgency": "critical",
+      "exploited": true,
+      "network_reachable": true,
+      "mitigations": [
+        { "type": "upgrade", "to": "2.4.7" },
+        { "type": "block_http_path", "pattern": "/api/import*" },
+        { "type": "stop_service", "when": "no_other_mitigation" }
+      ]
+    }
+  }
+}

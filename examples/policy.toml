@@ -1,0 +1,17 @@
+[[rule]]
+name    = "Critique, exploitée, exposée"
+when    = { priority = ["critical"], exposure = "internet", signed = true }
+action  = "mitigate"
+allow   = ["upgrade", "block_http_path", "restrict_network"]
+notify  = ["email:admin", "webhook:astreinte"]
+
+[[rule]]
+name    = "Critique interne"
+when    = { priority = ["critical"] }
+action  = "propose"   # prépare l'action, attend une confirmation
+notify  = ["email:admin"]
+
+[[rule]]
+name    = "Par défaut"
+action  = "notify"
+notify  = ["digest:quotidien"]

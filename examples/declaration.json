@@ -1,0 +1,14 @@
+{
+  "name": "example-widget",
+  "version": "2.3.1",
+  "tocsin": {
+    "spec": "0.1",
+    "feed": "https://security.example.org/tocsin/feed.json",
+    "push": "https://security.example.org/tocsin/hub",
+    "signer": {
+      "issuer": "https://token.actions.githubusercontent.com",
+      "identity": "https://github.com/example/widget/.github/workflows/advisory.yml@refs/heads/main"
+    },
+    "contact": "mailto:security@example.org"
+  }
+}
