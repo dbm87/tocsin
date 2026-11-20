@@ -1,11 +1,12 @@
 //! `tocsin`: command-line entry point of the reference agent.
 //!
-//! This first version works on files only: it validates the formats of the
-//! specification and evaluates one advisory against one component. Inventory,
-//! relays and fallback sources come next (spec roadmap, step 2).
+//! It validates the formats of the specification, inventories a Linux machine
+//! and evaluates one advisory against one component. Relays and fallback
+//! sources come next (spec roadmap, step 2).
 
 use anyhow::{Context as _, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tocsin_core::advisory::Match;
@@ -30,6 +31,32 @@ enum Command {
     },
     /// Evaluate one advisory against one installed component.
     Check(CheckArgs),
+    /// Inventory this Linux machine: components, services, listening ports.
+    Inventory(InventoryArgs),
+}
+
+#[derive(Args)]
+struct InventoryArgs {
+    /// Project directory whose lockfiles are read (repeatable).
+    #[arg(long = "project", value_name = "DIR")]
+    projects: Vec<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Summary)]
+    format: Format,
+    /// In the summary, also list services with no listening port.
+    #[arg(long)]
+    all: bool,
+    #[arg(long, default_value = "/", hide = true)]
+    fs_root: PathBuf,
+    #[arg(long, default_value = "/proc", hide = true)]
+    proc_root: PathBuf,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Format {
+    Summary,
+    Json,
+    Cyclonedx,
 }
 
 #[derive(Subcommand)]
@@ -196,6 +223,169 @@ fn check(args: CheckArgs) -> Result<()> {
     Ok(())
 }
 
+fn inventory(args: InventoryArgs) -> Result<()> {
+    let options = tocsin_inventory::Options {
+        fs_root: args.fs_root,
+        proc_root: args.proc_root,
+        projects: args.projects,
+        rpm: true,
+    };
+    let inventory = tocsin_inventory::collect(&options);
+    match args.format {
+        Format::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
+        Format::Cyclonedx => println!(
+            "{}",
+            serde_json::to_string_pretty(&tocsin_inventory::cyclonedx::to_cyclonedx(&inventory))?
+        ),
+        Format::Summary => print_summary(&inventory, args.all),
+    }
+    Ok(())
+}
+
+fn exposure_label(exposure: tocsin_inventory::Exposure) -> &'static str {
+    match exposure {
+        tocsin_inventory::Exposure::Loopback => "loopback only",
+        tocsin_inventory::Exposure::Lan => "local network",
+        tocsin_inventory::Exposure::AllInterfaces => "ALL INTERFACES",
+        tocsin_inventory::Exposure::Public => "PUBLIC ADDRESS",
+    }
+}
+
+fn print_summary(inventory: &tocsin_inventory::model::Inventory, all: bool) {
+    use tocsin_inventory::model::ServiceKind;
+
+    let host = &inventory.host;
+    println!(
+        "host: {} ({} {})",
+        host.hostname.as_deref().unwrap_or("?"),
+        host.os_id.as_deref().unwrap_or("?"),
+        host.os_version.as_deref().unwrap_or("")
+    );
+
+    let mut by_origin: BTreeMap<&str, usize> = BTreeMap::new();
+    for component in &inventory.components {
+        *by_origin.entry(component.origin.label()).or_default() += 1;
+    }
+    let origins: Vec<String> = by_origin
+        .iter()
+        .map(|(origin, n)| format!("{origin} {n}"))
+        .collect();
+    let declared = inventory
+        .components
+        .iter()
+        .filter(|c| c.declaration.is_some())
+        .count();
+    println!(
+        "components: {} ({}), {declared} with a declared Tocsin channel",
+        inventory.components.len(),
+        origins.join(", ")
+    );
+
+    let names: HashMap<&str, &str> = inventory
+        .components
+        .iter()
+        .map(|c| (c.purl.as_str(), c.name.as_str()))
+        .collect();
+    let mut shown: Vec<_> = inventory
+        .services
+        .iter()
+        .filter(|s| all || !s.listening.is_empty() || s.needs_restart())
+        .collect();
+    shown.sort_by(|a, b| b.exposure().cmp(&a.exposure()).then(a.name.cmp(&b.name)));
+    println!(
+        "services: {} ({} shown{})",
+        inventory.services.len(),
+        shown.len(),
+        if all {
+            ""
+        } else {
+            ": listening or needing a restart; --all for every service"
+        }
+    );
+
+    for service in shown {
+        let kind = match service.kind {
+            ServiceKind::SystemdUnit => "systemd",
+            ServiceKind::Container => "container",
+            ServiceKind::Process => "process",
+        };
+        let partial = if service.partial {
+            " (partial: run as root)"
+        } else {
+            ""
+        };
+        println!("\n{} [{kind}]{partial}", service.name);
+        // Most exposed first, TCP before UDP; the full list is in --format json.
+        let mut listeners: Vec<_> = service.listening.iter().collect();
+        listeners.sort_by(|a, b| {
+            b.exposure
+                .cmp(&a.exposure)
+                .then(a.protocol.cmp(b.protocol))
+                .then(a.port.cmp(&b.port))
+        });
+        const SHOWN_LISTENERS: usize = 5;
+        for listener in listeners.iter().take(SHOWN_LISTENERS) {
+            let address = if listener.address.contains(':') {
+                format!("[{}]", listener.address)
+            } else {
+                listener.address.clone()
+            };
+            println!(
+                "  listens {}/{address}:{} ({})",
+                listener.protocol,
+                listener.port,
+                exposure_label(listener.exposure)
+            );
+        }
+        if listeners.len() > SHOWN_LISTENERS {
+            println!(
+                "  … and {} more socket(s), see --format json",
+                listeners.len() - SHOWN_LISTENERS
+            );
+        }
+        if service.separate_filesystem {
+            println!(
+                "  own filesystem (container, Flatpak, Snap): its content is not inventoried yet"
+            );
+        }
+        if !service.uses.is_empty() {
+            let mut used: Vec<&str> = service
+                .uses
+                .iter()
+                .map(|u| names.get(u.purl.as_str()).copied().unwrap_or(&u.purl))
+                .collect();
+            used.dedup();
+            let more = used.len().saturating_sub(8);
+            let listed = used.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            println!("  uses {} component(s): {listed}{more}", used.len());
+        }
+        let replaced: Vec<&str> = service
+            .uses
+            .iter()
+            .filter(|u| u.evidence.replaced_on_disk())
+            .map(|u| names.get(u.purl.as_str()).copied().unwrap_or(&u.purl))
+            .collect();
+        if !replaced.is_empty() {
+            println!(
+                "  RESTART NEEDED: still running replaced files of {}",
+                replaced.join(", ")
+            );
+        }
+    }
+
+    if !inventory.warnings.is_empty() {
+        println!();
+        for warning in &inventory.warnings {
+            println!("warning: {warning}");
+        }
+    }
+}
+
 fn describe(mitigation: &Mitigation) -> String {
     match mitigation {
         Mitigation::Upgrade { to } => format!("upgrade to {to}"),
@@ -215,6 +405,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Validate { what } => validate(what),
         Command::Check(args) => check(args),
+        Command::Inventory(args) => inventory(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

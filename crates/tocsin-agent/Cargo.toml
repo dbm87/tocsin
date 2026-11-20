@@ -13,5 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 tocsin-core.workspace = true
+tocsin-inventory.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
