@@ -445,6 +445,7 @@ mod tests {
                 address: "0.0.0.0".parse().unwrap(),
                 port: 80,
                 inode: 7,
+                isolated: false,
             },
         )]
         .into_iter()
@@ -496,6 +497,7 @@ mod tests {
                 address: "127.0.0.1".parse().unwrap(),
                 port: 3000,
                 inode: 9,
+                isolated: false,
             },
         )]
         .into_iter()
@@ -614,6 +616,7 @@ mod tests {
                     address: "0.0.0.0".parse().unwrap(),
                     port: if inode == 3 { 22 } else { 9090 },
                     inode,
+                    isolated: false,
                 };
                 (inode, socket)
             })

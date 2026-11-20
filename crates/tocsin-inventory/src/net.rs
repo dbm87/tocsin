@@ -15,6 +15,10 @@ pub struct Socket {
     pub address: IpAddr,
     pub port: u16,
     pub inode: u64,
+    /// The socket lives in a network namespace other than the host's
+    /// (container…): it is reachable only through ports published to the
+    /// host, which appear as host sockets of their own (e.g. docker-proxy).
+    pub isolated: bool,
 }
 
 const TCP_LISTEN: &str = "0A";
@@ -67,6 +71,7 @@ pub fn parse_table(text: &str, protocol: &'static str, udp: bool) -> Vec<Socket>
                 address,
                 port,
                 inode: inode.parse().ok()?,
+                isolated: false,
             })
         })
         .collect()
@@ -117,13 +122,19 @@ impl From<&Socket> for Listener {
             protocol: socket.protocol,
             address: socket.address.to_string(),
             port: socket.port,
-            exposure: exposure(socket.address),
+            exposure: match exposure(socket.address) {
+                Exposure::Loopback => Exposure::Loopback,
+                _ if socket.isolated => Exposure::ContainerNetwork,
+                other => other,
+            },
         }
     }
 }
 
 /// Listening sockets of every network namespace in use, by socket inode.
 pub fn listening_sockets(proc_root: &Path, processes: &[Process]) -> HashMap<u64, Socket> {
+    let host_netns = crate::procfs::namespace(&proc_root.join("1"), "net")
+        .or_else(|| crate::procfs::namespace(&proc_root.join("self"), "net"));
     let mut sockets = HashMap::new();
     let mut seen = HashSet::new();
     for process in processes.iter().filter(|p| !p.socket_inodes.is_empty()) {
@@ -133,6 +144,7 @@ pub fn listening_sockets(proc_root: &Path, processes: &[Process]) -> HashMap<u64
         if !seen.insert(netns.clone()) {
             continue;
         }
+        let isolated = host_netns.as_ref().is_some_and(|host| host != netns);
         let dir = proc_root.join(process.pid.to_string()).join("net");
         for (file, protocol, udp) in [
             ("tcp", "tcp", false),
@@ -144,7 +156,7 @@ pub fn listening_sockets(proc_root: &Path, processes: &[Process]) -> HashMap<u64
                 sockets.extend(
                     parse_table(&text, protocol, udp)
                         .into_iter()
-                        .map(|s| (s.inode, s)),
+                        .map(|s| (s.inode, Socket { isolated, ..s })),
                 );
             }
         }
@@ -203,5 +215,36 @@ mod tests {
         assert_eq!(exposure("ff02::c".parse().unwrap()), Exposure::Lan);
         assert_eq!(exposure("ff05::c".parse().unwrap()), Exposure::Lan);
         assert_eq!(exposure("ff0e::1".parse().unwrap()), Exposure::Public);
+    }
+
+    #[test]
+    fn sockets_inside_a_container_namespace() {
+        let socket = |address: &str, isolated| Socket {
+            protocol: "tcp",
+            address: address.parse().unwrap(),
+            port: 8000,
+            inode: 1,
+            isolated,
+        };
+        // 0.0.0.0 inside a container is not every interface of the host.
+        assert_eq!(
+            Listener::from(&socket("0.0.0.0", true)).exposure,
+            Exposure::ContainerNetwork
+        );
+        assert_eq!(
+            Listener::from(&socket("127.0.0.1", true)).exposure,
+            Exposure::Loopback
+        );
+        assert_eq!(
+            Listener::from(&socket("0.0.0.0", false)).exposure,
+            Exposure::AllInterfaces
+        );
+    }
+
+    #[test]
+    fn own_namespace_is_not_isolated() {
+        let me = crate::procfs::read_process(Path::new("/proc"), std::process::id()).unwrap();
+        let sockets = listening_sockets(Path::new("/proc"), &[me]);
+        assert!(sockets.values().all(|s| !s.isolated));
     }
 }

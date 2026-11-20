@@ -245,6 +245,7 @@ fn inventory(args: InventoryArgs) -> Result<()> {
 fn exposure_label(exposure: tocsin_inventory::Exposure) -> &'static str {
     match exposure {
         tocsin_inventory::Exposure::Loopback => "loopback only",
+        tocsin_inventory::Exposure::ContainerNetwork => "container network only",
         tocsin_inventory::Exposure::Lan => "local network",
         tocsin_inventory::Exposure::AllInterfaces => "ALL INTERFACES",
         tocsin_inventory::Exposure::Public => "PUBLIC ADDRESS",

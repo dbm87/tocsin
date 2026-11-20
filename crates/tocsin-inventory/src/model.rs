@@ -86,11 +86,15 @@ pub struct Listener {
     pub exposure: Exposure,
 }
 
-/// Where a listening socket can be reached from, judged from its bind address.
+/// Where a listening socket can be reached from, judged from its bind address
+/// and network namespace. Ordered from the least to the most exposed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Exposure {
     Loopback,
+    /// Inside a container's network namespace: reachable from the host and
+    /// other containers, and from outside only through published ports.
+    ContainerNetwork,
     Lan,
     AllInterfaces,
     Public,
@@ -101,7 +105,9 @@ impl Exposure {
     /// to every interface is treated as reachable from the Internet.
     pub fn to_policy(self) -> tocsin_core::Exposure {
         match self {
-            Exposure::Loopback | Exposure::Lan => tocsin_core::Exposure::Local,
+            Exposure::Loopback | Exposure::ContainerNetwork | Exposure::Lan => {
+                tocsin_core::Exposure::Local
+            }
             Exposure::AllInterfaces | Exposure::Public => tocsin_core::Exposure::Internet,
         }
     }
